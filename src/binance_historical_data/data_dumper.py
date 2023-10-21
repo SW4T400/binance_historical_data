@@ -185,7 +185,7 @@ class BinanceDataDumper:
     @staticmethod
     def _get_user_country_from_ip() -> str:
         """Get user country to select the right binance url"""
-        url = 'https://ipinfo.io/json'
+        url = 'http://ipinfo.io/json' # removed https due to ssl error
         res = urllib.request.urlopen(url)
         data = json.load(res)
         return data.get("country", "Unknown")

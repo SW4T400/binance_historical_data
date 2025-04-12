@@ -19,10 +19,10 @@ from char import char
 from mpire import WorkerPool
 
 from joblib import Parallel, delayed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # from tqdm.auto import tqdm #for jupyter autodetec - no moving bars! bad!
 from tqdm import tqdm
-
 
 # Global constants
 LOGGER = logging.getLogger(__name__)
@@ -43,12 +43,15 @@ class BinanceDataDumper:
         ),
         "um": (
             "aggTrades",
-            "klines",
-            "trades",
+            "bookDepth",
+            "bookTicker",
             "indexPriceKlines",
+            "klines",
+            "liquidationSnapshot",
             "markPriceKlines",
-            "premiumIndexKlines",
             "metrics",
+            "premiumIndexKlines",
+            "trades",
         ),
     }
     _DATA_FREQUENCY_NEEDED_FOR_TYPE = (
@@ -213,8 +216,11 @@ class BinanceDataDumper:
                 # tqdm(list_trading_pairs, leave=True, desc="Tickers"):
 
                 # 1) Download all monthly data
-                if self._data_type != "metrics" and (
-                    date_end_first_day_of_month - relativedelta(days=1) > date_start
+                if (
+                    self._data_type != "metrics"
+                    and (  # is fullmonth end > start target?
+                        date_end_first_day_of_month - relativedelta(days=1) > date_start
+                    )
                 ):
                     self._download_data_for_1_ticker(
                         ticker=ticker,
@@ -247,6 +253,66 @@ class BinanceDataDumper:
         #####
         # Print statistics
         self._print_dump_statistics()
+
+    def dump_specific_pairs(
+        self,
+        pairs_to_dump,
+        is_to_update_existing=False,
+    ):
+        """Dump data for specific symbol-date pairs"""
+        self.dict_new_points_saved_by_ticker.clear()
+
+        # Standardize input format
+        pairs_by_symbol = defaultdict(list)
+        if isinstance(pairs_to_dump, dict):
+            pairs_by_symbol.update(pairs_to_dump)
+        else:
+            for symbol, date in pairs_to_dump:
+                pairs_by_symbol[symbol].append(date)
+
+        with tqdm(
+            total=len(pairs_by_symbol),
+            desc="Processing symbols",
+            position=0,
+            leave=True,
+        ) as pbar:
+            for symbol, dates in pairs_by_symbol.items():
+                # Create directory structure
+                dir_where_to_save = self.get_local_dir_to_data(symbol, "daily")
+                if not os.path.exists(dir_where_to_save):
+                    try:
+                        os.makedirs(dir_where_to_save)
+                    except FileExistsError:
+                        pass
+
+                processes = 1 if "trades" in self._data_type.lower() else 10
+                list_args = [(symbol, date, "daily") for date in dates]
+
+                if list_args:
+                    list_saved_dates = list(
+                        tqdm(
+                            Parallel(
+                                n_jobs=processes, return_as="generator", verbose=0
+                            )(
+                                delayed(self._download_data_for_1_ticker_1_date)(
+                                    symbol, date, "daily"
+                                )
+                                for symbol, date, _ in list_args
+                            ),
+                            total=len(list_args),
+                            desc=f"Daily files ({symbol})",
+                            position=1,
+                            leave=False,
+                        )
+                    )
+
+                    self.dict_new_points_saved_by_ticker[symbol]["daily"] = len(
+                        [d for d in list_saved_dates if d]
+                    )
+
+                pbar.update(1)
+
+            self._print_dump_statistics()
 
     def get_list_all_trading_pairs(self):
         """Get all trading pairs available at binance now"""
@@ -823,3 +889,154 @@ class BinanceDataDumper:
                 date_to_use = date_to_use + relativedelta(days=1)
         LOGGER.debug("---> Dates created: %d", len(list_dates))
         return list_dates
+
+
+# class ParallelBinanceDataDumper:
+#     def __init__(self, base_dumper):
+#         """Initialize with an instance of BinanceDataDumper"""
+#         self.dumper = base_dumper
+#         self.logger = logging.getLogger(__name__)
+
+#     def _process_single_ticker(
+#         self, ticker, date_start, date_end, is_to_update_existing
+#     ):
+#         """Process a single ticker's data download"""
+#         try:
+#             self.dumper._download_data_for_1_ticker(
+#                 ticker=ticker,
+#                 date_start=date_start,
+#                 date_end=date_end,
+#                 timeperiod_per_file="monthly",
+#                 is_to_update_existing=is_to_update_existing,
+#             )
+
+#             # Handle daily data for the last month
+#             if date_end:
+#                 date_end_first_day = datetime.date(date_end.year, date_end.month, 1)
+#                 self.dumper._download_data_for_1_ticker(
+#                     ticker=ticker,
+#                     date_start=date_end_first_day,
+#                     date_end=date_end,
+#                     timeperiod_per_file="daily",
+#                     is_to_update_existing=is_to_update_existing,
+#                 )
+#             return ticker, True
+#         except Exception as e:
+#             self.logger.error(f"Error processing ticker {ticker}: {str(e)}")
+#             return ticker, False
+
+#     def parallel_dump_data(
+#         self,
+#         tickers,
+#         date_start=None,
+#         date_end=None,
+#         is_to_update_existing=False,
+#         n_jobs=-1,
+#         tickers_to_exclude=None,
+#     ):
+#         """
+#         Parallel version of dump_data that processes multiple tickers simultaneously
+
+#         Args:
+#             tickers (list[str]): List of trading pairs to dump data for
+#             date_start (datetime.date): Start date for data dump
+#             date_end (datetime.date): End date for data dump
+#             is_to_update_existing (bool): Whether to update existing data
+#             n_jobs (int): Number of parallel jobs (default: -1 uses all cores)
+#             tickers_to_exclude (list[str]): Tickers to exclude from processing
+#         """
+#         # Handle date defaults
+#         if date_start is None:
+#             date_start = datetime.date(year=2017, month=1, day=1)
+#         if date_end is None:
+#             date_end = datetime.utcnow().date() - relativedelta(days=1)
+
+#         # Filter tickers
+#         if tickers is None:
+#             tickers = [
+#                 t
+#                 for t in self.dumper.get_list_all_trading_pairs()
+#                 if t.endswith("USDT")
+#             ]
+#         if tickers_to_exclude:
+#             tickers = [t for t in tickers if t not in tickers_to_exclude]
+
+#         self.logger.info(f"Starting parallel download for {len(tickers)} tickers")
+
+#         # Create progress bar for overall process
+#         with tqdm(total=len(tickers), desc="Processing Tickers", position=0) as pbar:
+#             results = Parallel(n_jobs=n_jobs, backend="loky", verbose=0)(
+#                 delayed(self._process_single_ticker)(
+#                     ticker, date_start, date_end, is_to_update_existing
+#                 )
+#                 for ticker in tickers
+#             )
+
+#             # Update progress bar after each ticker completes
+#             for _ in results:
+#                 pbar.update(1)
+
+#         # Process results
+#         successful = [ticker for ticker, success in results if success]
+#         failed = [ticker for ticker, success in results if not success]
+
+#         self.logger.info(
+#             f"Download complete. Successful: {len(successful)}, Failed: {len(failed)}"
+#         )
+#         if failed:
+#             self.logger.warning(f"Failed tickers: {', '.join(failed)}")
+
+#         return successful, failed
+
+
+# class ParallelBinanceDataDumper:
+#     """POINTLESS AS EVEN 1 Dumper uses my Internetconnection fully! 330 MBIT!!"""
+
+#     def __init__(self, base_dumper):
+#         self.dumper = base_dumper
+
+#     def parallel_dump(self, tickers, n_jobs=-1, **kwargs):
+#         """Parallel download for multiple tickers
+
+#         Args:
+#             tickers (list[str]): List of tickers to process in parallel
+#             n_jobs (int): Number of parallel jobs
+#             **kwargs: All other parameters passed directly to dump_data
+#         """
+#         with tqdm(total=len(tickers), desc="Processing Tickers", unit="ticker") as pbar:
+#             Parallel(n_jobs=n_jobs)(
+#                 delayed(self.dumper.dump_data)(
+#                     tickers=[ticker],  # Single ticker per job
+#                     **kwargs,  # Pass through all other parameters
+#                 )
+#                 for ticker in tickers
+#             )
+#             pbar.update(len(tickers))
+
+
+class ParallelBinanceDataDumper:
+    """POINTLESS AS EVEN 1 Dumper uses my Internetconnection fully! 330 MBIT!!"""
+
+    def __init__(self, base_dumper):
+        self.dumper = base_dumper
+
+    def parallel_dump(self, tickers, n_jobs=-1, **kwargs):
+        """Parallel download for multiple tickers
+
+        Args:
+            tickers (list[str]): List of tickers to process in parallel
+            n_jobs (int): Number of parallel jobs
+            **kwargs: All other parameters passed directly to dump_data
+        """
+        with tqdm(total=len(tickers), desc="Processing Tickers", unit="ticker") as pbar:
+            # Use return_as="generator" to get results as they are completed
+            results_generator = Parallel(n_jobs=n_jobs, return_as="generator")(
+                delayed(self.dumper.dump_data)(
+                    tickers=[ticker],  # Single ticker per job
+                    **kwargs,  # Pass through all other parameters
+                )
+                for ticker in tickers
+            )
+            # Iterate over the generator and update the progress bar as each job completes
+            for _ in results_generator:
+                pbar.update(1)

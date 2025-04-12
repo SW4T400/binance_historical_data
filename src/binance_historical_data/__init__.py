@@ -1,4 +1,5 @@
 """"""
+
 # Standard library imports
 
 # Third party imports
@@ -6,6 +7,7 @@
 # Local imports
 from . import logger
 from .data_dumper import BinanceDataDumper
+from .data_dumper import ParallelBinanceDataDumper
 
 # Global constants
 __all__ = ["BinanceDataDumper"]

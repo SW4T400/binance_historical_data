@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections import Counter
 import zipfile
 import datetime
+import time
 from dateutil.relativedelta import relativedelta
 
 # Third party imports
@@ -98,7 +99,8 @@ class BinanceDataDumper:
                 Defaults to "1m".
             max_concurrent_downloads (int): \
                 Maximum number of concurrent file downloads. \
-                Defaults to 1 for 'trades' (large files), 10 for all others. \
+                Defaults to 1 for 'trades' (large files), 5 for all others. \
+                Use 5-7 for safety (avoids CloudFront WAF blocking). \
                 Set explicitly to override auto-detection.
         """
         if asset_class not in (self._ASSET_CLASSES + self._FUTURES_ASSET_CLASSES):
@@ -132,7 +134,8 @@ class BinanceDataDumper:
         # Auto-detect concurrent downloads if not specified
         if max_concurrent_downloads is None:
             # Only 'trades' (not 'aggTrades') should default to 1
-            self._max_concurrent_downloads = 1 if data_type == "trades" else 10
+            # Use 5 for others (safer than 10 to avoid CloudFront WAF blocking)
+            self._max_concurrent_downloads = 1 if data_type == "trades" else 5
         else:
             self._max_concurrent_downloads = max_concurrent_downloads
 
@@ -756,41 +759,106 @@ class BinanceDataDumper:
         return folder_path
 
     @staticmethod
-    def _download_raw_file(str_url_path_to_file, str_path_where_to_save):
-        """Download file from binance server by URL"""
+    def _download_raw_file(str_url_path_to_file, str_path_where_to_save, max_retries=3):
+        """Download file from binance server by URL with retry logic and safety features
 
+        Args:
+            str_url_path_to_file: URL to download from
+            str_path_where_to_save: Local path to save file
+            max_retries: Maximum number of retry attempts (default: 3)
+
+        Returns:
+            1 if successful, 0 if failed
+        """
         LOGGER.debug("Download file from: %s", str_url_path_to_file)
         str_url_path_to_file = str_url_path_to_file.replace("\\", "/")
-        try:
-            if "trades" not in str_url_path_to_file.lower():
-                urllib.request.urlretrieve(str_url_path_to_file, str_path_where_to_save)
-            else:  # only show progress bar for trades data as the files are usually big
-                with tqdm(
-                    unit="B",
-                    unit_scale=True,
-                    miniters=1,
-                    desc="downloading: " + str_url_path_to_file.split("/")[-1],
-                ) as progress_bar:
 
-                    def progress_hook(count, block_size, total_size):
-                        current_size = block_size * count
-                        previous_progress = progress_bar.n / total_size * 100
-                        current_progress = current_size / total_size * 100
+        # Browser User-Agent to avoid CloudFront WAF blocking
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
 
-                        if current_progress > previous_progress + 10:
-                            progress_bar.total = total_size
-                            progress_bar.update(current_size - progress_bar.n)
+        for attempt in range(max_retries):
+            try:
+                # Create request with headers
+                req = urllib.request.Request(str_url_path_to_file, headers=headers)
 
-                    urllib.request.urlretrieve(
-                        str_url_path_to_file, str_path_where_to_save, progress_hook
+                if "trades" not in str_url_path_to_file.lower():
+                    # Simple download without progress bar
+                    with urllib.request.urlopen(req, timeout=60) as response:
+                        with open(str_path_where_to_save, 'wb') as out_file:
+                            out_file.write(response.read())
+                else:
+                    # Download with progress bar for large trades files
+                    with tqdm(
+                        unit="B",
+                        unit_scale=True,
+                        miniters=1,
+                        desc="downloading: " + str_url_path_to_file.split("/")[-1],
+                    ) as progress_bar:
+
+                        def progress_hook(count, block_size, total_size):
+                            current_size = block_size * count
+                            if total_size > 0:
+                                previous_progress = progress_bar.n / total_size * 100
+                                current_progress = current_size / total_size * 100
+                                if current_progress > previous_progress + 10:
+                                    progress_bar.total = total_size
+                                    progress_bar.update(current_size - progress_bar.n)
+
+                        # Use urlretrieve with custom opener that includes headers
+                        opener = urllib.request.build_opener()
+                        opener.addheaders = list(headers.items())
+                        urllib.request.install_opener(opener)
+                        urllib.request.urlretrieve(
+                            str_url_path_to_file, str_path_where_to_save, progress_hook
+                        )
+
+                return 1  # Success
+
+            except urllib.error.HTTPError as ex:
+                if ex.code == 404:
+                    # File doesn't exist - don't retry
+                    LOGGER.debug("[WARNING] File not found (404): %s", str_url_path_to_file)
+                    return 0
+                elif ex.code == 403:
+                    # Forbidden - likely rate limited by WAF
+                    wait_time = (2 ** attempt) * 5  # Exponential backoff: 5s, 10s, 20s
+                    LOGGER.warning(
+                        "[RATE LIMIT] 403 Forbidden on %s. Waiting %ds before retry %d/%d",
+                        str_url_path_to_file.split("/")[-1],
+                        wait_time,
+                        attempt + 1,
+                        max_retries
                     )
-        except urllib.error.URLError as ex:
-            LOGGER.debug("[WARNING] File not found: %s", str_url_path_to_file)
-            return 0
-        except Exception as ex:
-            LOGGER.warning("Unable to download raw file: %s", ex)
-            return 0
-        return 1
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        LOGGER.error("Max retries reached for: %s", str_url_path_to_file)
+                        return 0
+                else:
+                    LOGGER.warning("HTTP Error %s: %s", ex.code, str_url_path_to_file)
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                    return 0
+
+            except urllib.error.URLError as ex:
+                LOGGER.warning("URL Error: %s - %s", ex.reason, str_url_path_to_file)
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return 0
+
+            except Exception as ex:
+                LOGGER.warning("Unable to download raw file: %s - %s", ex, str_url_path_to_file)
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return 0
+
+        return 0  # All retries exhausted
 
     def _print_dump_statistics(self):
         """Print the latest dump statistics"""

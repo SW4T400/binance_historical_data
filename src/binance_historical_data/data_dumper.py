@@ -113,8 +113,8 @@ class BinanceDataDumper:
                 Defaults to "1m".
             max_concurrent_downloads (int): \
                 Maximum number of concurrent file downloads. \
-                Defaults to 1 for 'trades' (large files), 10 for all others. \
-                Community says 5 is conservative. We use 10 for faster downloads. \
+                Defaults to 1 for 'trades' (large files), 30 for all others. \
+                Community says 5 is conservative. We use 30 for faster downloads. \
                 Circuit breaker protects against rate limiting. \
                 Set explicitly to override auto-detection.
         """
@@ -157,8 +157,8 @@ class BinanceDataDumper:
         # Auto-detect concurrent downloads if not specified
         if max_concurrent_downloads is None:
             # Only 'trades' (not 'aggTrades') should default to 1
-            # Use 10 for others (test higher concurrency)
-            self._max_concurrent_downloads = 1 if data_type == "trades" else 10
+            # Use 30 for others (testing higher concurrency on 300 Mbit line)
+            self._max_concurrent_downloads = 1 if data_type == "trades" else 30
         else:
             self._max_concurrent_downloads = max_concurrent_downloads
 
@@ -173,6 +173,7 @@ class BinanceDataDumper:
         self._request_count = 0
         self._successful_requests = 0
         self._failed_requests = 0
+        self._not_found_requests = 0  # Track 404 errors separately
         self._active_connections = 0
         self._max_concurrent_connections = 0
         self._request_start_time = None
@@ -188,6 +189,7 @@ class BinanceDataDumper:
         is_to_update_existing=False,
         int_max_tickers_to_get=None,
         tickers_to_exclude=None,
+        print_benchmark=True,
     ):
         """Main method to dump new of update existing historical data
 
@@ -199,6 +201,9 @@ class BinanceDataDumper:
                 list trading pairs which to exclude from dump
             date_start (datetime.date): Date from which to start dump
             date_end (datetime.date): The last date for which to dump data
+            print_benchmark (bool): Whether to print benchmark stats after this dump.\
+                Set to False when dumping multiple tickers in a loop, then call\
+                print_final_benchmark() at the end for cumulative stats. Defaults to True.
             is_to_update_existing (bool): \
                 Flag if you want to update data if it's already exists
             int_max_tickers_to_get (int): Max number of trading pairs to get
@@ -307,14 +312,22 @@ class BinanceDataDumper:
 
         #####
         # Print statistics
-        self._print_dump_statistics()
+        self._print_dump_statistics(print_benchmark=print_benchmark)
 
     def dump_specific_pairs(
         self,
         pairs_to_dump,
         is_to_update_existing=False,
+        print_benchmark=True,
     ):
-        """Dump data for specific symbol-date pairs"""
+        """Dump data for specific symbol-date pairs
+
+        Args:
+            pairs_to_dump: List of (symbol, date) tuples or dict mapping symbols to date lists
+            is_to_update_existing (bool): Whether to update existing files
+            print_benchmark (bool): Whether to print benchmark stats after this dump.
+                Defaults to True.
+        """
         self.dict_new_points_saved_by_ticker.clear()
 
         # Standardize input format
@@ -370,7 +383,7 @@ class BinanceDataDumper:
 
                 pbar.update(1)
 
-            self._print_dump_statistics()
+            self._print_dump_statistics(print_benchmark=print_benchmark)
 
     def get_list_all_trading_pairs(self):
         """Get all trading pairs available at binance now"""
@@ -948,6 +961,7 @@ class BinanceDataDumper:
                 self._active_connections -= 1
                 if ex.code == 404:
                     # File doesn't exist - don't retry, don't count as failure
+                    self._not_found_requests += 1
                     LOGGER.debug("[WARNING] File not found (404): %s", str_url_path_to_file)
                     return 0
                 elif ex.code == 418:
@@ -1071,10 +1085,17 @@ class BinanceDataDumper:
         self._failed_requests += 1
         return 0  # All retries exhausted
 
-    def _print_dump_statistics(self):
-        """Print the latest dump statistics"""
-        # Print request benchmark statistics
-        self._print_request_benchmark()
+    def _print_dump_statistics(self, print_benchmark=True):
+        """Print the latest dump statistics
+
+        Args:
+            print_benchmark (bool): Whether to print request benchmark statistics.
+                Defaults to True. Set to False when processing multiple tickers
+                to avoid repetitive output.
+        """
+        # Print request benchmark statistics (if enabled)
+        if print_benchmark:
+            self._print_request_benchmark()
 
         LOGGER.info(
             "Tried to dump data for %d tickers:",
@@ -1099,10 +1120,12 @@ class BinanceDataDumper:
 
         success_pct = (self._successful_requests / self._request_count * 100) if self._request_count > 0 else 0
         failed_pct = (self._failed_requests / self._request_count * 100) if self._request_count > 0 else 0
+        not_found_pct = (self._not_found_requests / self._request_count * 100) if self._request_count > 0 else 0
 
         print(f"Total Requests Sent: {self._request_count}")
         print(f"---> Successful: {self._successful_requests} ({success_pct:.1f}%)")
-        print(f"---> Failed: {self._failed_requests} ({failed_pct:.1f}%)")
+        print(f"---> Not Found (404): {self._not_found_requests} ({not_found_pct:.1f}%)")
+        print(f"---> Failed (Rate Limit/Error): {self._failed_requests} ({failed_pct:.1f}%)")
 
         print("Concurrent Connections:")
         print(f"---> Peak Concurrent: {self._max_concurrent_connections}")
@@ -1129,6 +1152,23 @@ class BinanceDataDumper:
             print(f"---> Average Speed: {speed_mbps:.2f} Mbit/s")
 
         print("=" * 79 + "\n")
+
+    def print_final_benchmark(self):
+        """Print final cumulative benchmark statistics across all dumps.
+
+        Call this method at the end of your script after processing multiple tickers
+        to see the total cumulative statistics. The benchmark counters accumulate
+        across all dump_data() calls since the BinanceDataDumper was created.
+
+        Example:
+            # Process multiple tickers without per-ticker benchmark spam
+            for ticker in tickers:
+                dumper.dump_data(tickers=[ticker], print_benchmark=False)
+
+            # Print final cumulative stats at the end
+            dumper.print_final_benchmark()
+        """
+        self._print_request_benchmark()
 
     def _print_full_dump_statististics(self):
         """"""

@@ -85,6 +85,7 @@ class BinanceDataDumper:
         asset_class="spot",  # spot, um, cm
         data_type="klines",  # aggTrades, klines, trades
         data_frequency="1m",  # argument for data_type="klines"
+        max_concurrent_downloads=None,  # max concurrent file downloads
     ) -> None:
         """Init object to dump all data from binance servers
 
@@ -95,6 +96,10 @@ class BinanceDataDumper:
             data_frequency (str): \
                 Data frequency. [1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h]
                 Defaults to "1m".
+            max_concurrent_downloads (int): \
+                Maximum number of concurrent file downloads. \
+                Defaults to 1 for 'trades' (large files), 10 for all others. \
+                Set explicitly to override auto-detection.
         """
         if asset_class not in (self._ASSET_CLASSES + self._FUTURES_ASSET_CLASSES):
             raise ValueError(
@@ -123,6 +128,13 @@ class BinanceDataDumper:
         self._base_url = "https://data.binance.vision/data"
         self._asset_class = asset_class
         self._data_type = data_type
+
+        # Auto-detect concurrent downloads if not specified
+        if max_concurrent_downloads is None:
+            # Only 'trades' (not 'aggTrades') should default to 1
+            self._max_concurrent_downloads = 1 if data_type == "trades" else 10
+        else:
+            self._max_concurrent_downloads = max_concurrent_downloads
 
     @char
     def dump_data(
@@ -285,7 +297,7 @@ class BinanceDataDumper:
                     except FileExistsError:
                         pass
 
-                processes = 1 if "trades" in self._data_type.lower() else 10
+                processes = self._max_concurrent_downloads
                 list_args = [(symbol, date, "daily") for date in dates]
 
                 if list_args:
@@ -612,7 +624,7 @@ class BinanceDataDumper:
                 pass
         #####
         processes = min(
-            len(list_args), 1 if "trades" in self._data_type.lower() else 10
+            len(list_args), self._max_concurrent_downloads
         )
 
         # if list_args:  # Only create progress bar if there are files to download

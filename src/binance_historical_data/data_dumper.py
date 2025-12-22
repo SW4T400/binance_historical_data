@@ -26,6 +26,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # Global constants
+# IMPORTANT: To see benchmark statistics and logging output, configure logging
+# in your script BEFORE importing BinanceDataDumper:
+#
+# import logging
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(levelname)s - %(message)s',
+#     handlers=[
+#         logging.FileHandler('download.log', encoding='utf-8'),
+#         logging.StreamHandler()  # Also print to console
+#     ]
+# )
+# from binance_historical_data import BinanceDataDumper  # Import AFTER logging config
+#
 LOGGER = logging.getLogger(__name__)
 
 
@@ -99,10 +113,19 @@ class BinanceDataDumper:
                 Defaults to "1m".
             max_concurrent_downloads (int): \
                 Maximum number of concurrent file downloads. \
-                Defaults to 1 for 'trades' (large files), 5 for all others. \
-                Use 5-7 for safety (avoids CloudFront WAF blocking). \
+                Defaults to 1 for 'trades' (large files), 10 for all others. \
+                Community says 5 is conservative. We use 10 for faster downloads. \
+                Circuit breaker protects against rate limiting. \
                 Set explicitly to override auto-detection.
         """
+        # Confirm editable install is working
+        import os as _os_check
+        file_mtime = _os_check.path.getmtime(__file__)
+        file_time = datetime.datetime.fromtimestamp(file_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[BinanceDataDumper] Loaded from: {__file__}")
+        print(f"[BinanceDataDumper] File last modified: {file_time}")
+        print(f"[BinanceDataDumper] Benchmarking and concurrency features enabled")
+
         if asset_class not in (self._ASSET_CLASSES + self._FUTURES_ASSET_CLASSES):
             raise ValueError(
                 f"Unknown asset class: {asset_class} "
@@ -134,10 +157,27 @@ class BinanceDataDumper:
         # Auto-detect concurrent downloads if not specified
         if max_concurrent_downloads is None:
             # Only 'trades' (not 'aggTrades') should default to 1
-            # Use 5 for others (safer than 10 to avoid CloudFront WAF blocking)
-            self._max_concurrent_downloads = 1 if data_type == "trades" else 5
+            # Use 10 for others (test higher concurrency)
+            self._max_concurrent_downloads = 1 if data_type == "trades" else 10
         else:
             self._max_concurrent_downloads = max_concurrent_downloads
+
+        # Circuit breaker pattern to prevent hammering during rate limiting
+        self._circuit_breaker_failures = 0
+        self._circuit_breaker_threshold = 5  # Stop after 5 consecutive failures
+        self._circuit_breaker_reset_time = 300  # 5 minutes
+        self._circuit_breaker_last_failure = None
+        self._is_circuit_broken = False
+
+        # Request tracking and benchmarking
+        self._request_count = 0
+        self._successful_requests = 0
+        self._failed_requests = 0
+        self._active_connections = 0
+        self._max_concurrent_connections = 0
+        self._request_start_time = None
+        self._request_timings = []  # Store individual request durations
+        self._bytes_downloaded = 0
 
     @char
     def dump_data(
@@ -307,7 +347,10 @@ class BinanceDataDumper:
                     list_saved_dates = list(
                         tqdm(
                             Parallel(
-                                n_jobs=processes, return_as="generator", verbose=0
+                                n_jobs=processes,
+                                return_as="generator",
+                                backend="threading",  # Threading: same speed as loky + benchmarks work
+                                verbose=0
                             )(
                                 delayed(self._download_data_for_1_ticker_1_date)(
                                     symbol, date, "daily"
@@ -661,7 +704,8 @@ class BinanceDataDumper:
                     Parallel(
                         n_jobs=processes,
                         return_as="generator",
-                        verbose=0,  # Just keep this to silence joblib
+                        backend="threading",  # Threading: faster for I/O + benchmarks work
+                        verbose=0,
                     )(
                         delayed(self._download_data_for_1_ticker_1_date)(
                             ticker, date_obj, timeperiod_per_file
@@ -670,8 +714,8 @@ class BinanceDataDumper:
                     ),
                     total=len(list_args),
                     desc=f"{timeperiod_per_file} files ({ticker})",
-                    position=1,  # Fixed position below ticker bar
-                    leave=True,  # Don't leave this bar after completion
+                    position=1,
+                    leave=True,
                 )
             )
         else:
@@ -758,8 +802,48 @@ class BinanceDataDumper:
 
         return folder_path
 
-    @staticmethod
-    def _download_raw_file(str_url_path_to_file, str_path_where_to_save, max_retries=3):
+    def _check_circuit_breaker(self):
+        """Check if circuit breaker is open, reset if enough time has passed"""
+        if not self._is_circuit_broken:
+            return False
+
+        # Check if reset time has passed
+        if self._circuit_breaker_last_failure:
+            time_since_failure = time.time() - self._circuit_breaker_last_failure
+            if time_since_failure >= self._circuit_breaker_reset_time:
+                # Reset circuit breaker
+                LOGGER.info(
+                    "[CIRCUIT BREAKER] Reset after %d seconds. Resuming downloads.",
+                    int(time_since_failure)
+                )
+                self._is_circuit_broken = False
+                self._circuit_breaker_failures = 0
+                return False
+
+        return True
+
+    def _record_download_failure(self, error_type):
+        """Record a download failure for circuit breaker tracking"""
+        self._circuit_breaker_failures += 1
+        self._circuit_breaker_last_failure = time.time()
+
+        if self._circuit_breaker_failures >= self._circuit_breaker_threshold:
+            if not self._is_circuit_broken:
+                self._is_circuit_broken = True
+                LOGGER.error(
+                    "[CIRCUIT BREAKER] Triggered after %d failures (%s). "
+                    "Stopping downloads for %d seconds to avoid IP ban.",
+                    self._circuit_breaker_failures,
+                    error_type,
+                    self._circuit_breaker_reset_time
+                )
+
+    def _record_download_success(self):
+        """Record a successful download, reset failure counter"""
+        if self._circuit_breaker_failures > 0:
+            self._circuit_breaker_failures = 0
+
+    def _download_raw_file(self, str_url_path_to_file, str_path_where_to_save, max_retries=3):
         """Download file from binance server by URL with retry logic and safety features
 
         Args:
@@ -770,6 +854,19 @@ class BinanceDataDumper:
         Returns:
             1 if successful, 0 if failed
         """
+        # Check circuit breaker before attempting download
+        if self._check_circuit_breaker():
+            LOGGER.warning(
+                "[CIRCUIT BREAKER] Open - skipping download: %s",
+                str_url_path_to_file.split("/")[-1]
+            )
+            return 0
+
+        # Track request start
+        request_start = time.time()
+        if self._request_start_time is None:
+            self._request_start_time = request_start
+
         LOGGER.debug("Download file from: %s", str_url_path_to_file)
         str_url_path_to_file = str_url_path_to_file.replace("\\", "/")
 
@@ -780,6 +877,22 @@ class BinanceDataDumper:
 
         for attempt in range(max_retries):
             try:
+                # Track active connections
+                self._active_connections += 1
+                self._request_count += 1
+                if self._active_connections > self._max_concurrent_connections:
+                    self._max_concurrent_connections = self._active_connections
+
+                # Log connection info every 10 requests
+                if self._request_count % 10 == 0:
+                    elapsed = time.time() - self._request_start_time
+                    rate = self._request_count / elapsed if elapsed > 0 else 0
+                    tqdm.write(
+                        f"[BENCHMARK] Requests: {self._request_count} | "
+                        f"Active: {self._active_connections} | Peak: {self._max_concurrent_connections} | "
+                        f"Rate: {rate:.2f} req/s | Success: {self._successful_requests} | Failed: {self._failed_requests}"
+                    )
+
                 # Create request with headers
                 req = urllib.request.Request(str_url_path_to_file, headers=headers)
 
@@ -787,7 +900,9 @@ class BinanceDataDumper:
                     # Simple download without progress bar
                     with urllib.request.urlopen(req, timeout=60) as response:
                         with open(str_path_where_to_save, 'wb') as out_file:
-                            out_file.write(response.read())
+                            data = response.read()
+                            out_file.write(data)
+                            self._bytes_downloaded += len(data)
                 else:
                     # Download with progress bar for large trades files
                     with tqdm(
@@ -813,19 +928,46 @@ class BinanceDataDumper:
                         urllib.request.urlretrieve(
                             str_url_path_to_file, str_path_where_to_save, progress_hook
                         )
+                        # Track bytes downloaded
+                        import os as _os_size
+                        if _os_size.path.exists(str_path_where_to_save):
+                            self._bytes_downloaded += _os_size.path.getsize(str_path_where_to_save)
 
-                return 1  # Success
+                # Success - reset failure counter and track stats
+                self._record_download_success()
+                self._successful_requests += 1
+                self._active_connections -= 1
+
+                # Track request duration
+                request_duration = time.time() - request_start
+                self._request_timings.append(request_duration)
+
+                return 1
 
             except urllib.error.HTTPError as ex:
+                self._active_connections -= 1
                 if ex.code == 404:
-                    # File doesn't exist - don't retry
+                    # File doesn't exist - don't retry, don't count as failure
                     LOGGER.debug("[WARNING] File not found (404): %s", str_url_path_to_file)
                     return 0
+                elif ex.code == 418:
+                    # IP BAN - Critical failure, trigger circuit breaker immediately
+                    self._record_download_failure("IP_BAN_418")
+                    self._failed_requests += 1
+                    LOGGER.error(
+                        "[IP BAN] HTTP 418 - IP banned by Binance. All downloads stopped. "
+                        "Ban typically lasts 2 minutes to 3 days. Wait before retrying."
+                    )
+                    # Force circuit breaker open
+                    self._is_circuit_broken = True
+                    self._circuit_breaker_failures = self._circuit_breaker_threshold
+                    return 0
                 elif ex.code == 403:
-                    # Forbidden - likely rate limited by WAF
+                    # Forbidden - WAF rate limiting
+                    self._record_download_failure("WAF_403")
                     wait_time = (2 ** attempt) * 5  # Exponential backoff: 5s, 10s, 20s
                     LOGGER.warning(
-                        "[RATE LIMIT] 403 Forbidden on %s. Waiting %ds before retry %d/%d",
+                        "[RATE LIMIT] 403 Forbidden (WAF block) on %s. Waiting %ds before retry %d/%d",
                         str_url_path_to_file.split("/")[-1],
                         wait_time,
                         attempt + 1,
@@ -836,32 +978,104 @@ class BinanceDataDumper:
                         continue
                     else:
                         LOGGER.error("Max retries reached for: %s", str_url_path_to_file)
+                        self._failed_requests += 1
                         return 0
+                elif ex.code == 429:
+                    # Too Many Requests - Standard rate limiting
+                    self._record_download_failure("RATE_LIMIT_429")
+                    wait_time = (2 ** attempt) * 5
+                    LOGGER.warning(
+                        "[RATE LIMIT] 429 Too Many Requests on %s. Waiting %ds before retry %d/%d",
+                        str_url_path_to_file.split("/")[-1],
+                        wait_time,
+                        attempt + 1,
+                        max_retries
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
+                    self._failed_requests += 1
+                    return 0
+                elif ex.code == 503:
+                    # Service Unavailable - CloudFront overload
+                    self._record_download_failure("CLOUDFRONT_503")
+                    wait_time = (2 ** attempt) * 5
+                    LOGGER.warning(
+                        "[CLOUDFRONT] 503 Service Unavailable (CDN overload) on %s. Waiting %ds",
+                        str_url_path_to_file.split("/")[-1],
+                        wait_time
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
+                    self._failed_requests += 1
+                    return 0
                 else:
                     LOGGER.warning("HTTP Error %s: %s", ex.code, str_url_path_to_file)
                     if attempt < max_retries - 1:
                         time.sleep(2 ** attempt)  # Exponential backoff
                         continue
+                    self._failed_requests += 1
                     return 0
 
             except urllib.error.URLError as ex:
-                LOGGER.warning("URL Error: %s - %s", ex.reason, str_url_path_to_file)
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                return 0
+                self._active_connections -= 1
+                # URLError often wraps SSL errors which indicate rate limiting
+                error_str = str(ex.reason).lower()
+                if "ssl" in error_str or "eof" in error_str or "protocol" in error_str:
+                    # SSL errors are actually rate limiting per Binance support
+                    self._record_download_failure("SSL_ERROR_RATE_LIMIT")
+                    wait_time = (2 ** attempt) * 5
+                    LOGGER.warning(
+                        "[RATE LIMIT] SSL/Connection error (hidden rate limit) on %s. "
+                        "Waiting %ds before retry %d/%d",
+                        str_url_path_to_file.split("/")[-1],
+                        wait_time,
+                        attempt + 1,
+                        max_retries
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
+                    self._failed_requests += 1
+                    return 0
+                else:
+                    LOGGER.warning("URL Error: %s - %s", ex.reason, str_url_path_to_file)
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    self._failed_requests += 1
+                    return 0
 
             except Exception as ex:
-                LOGGER.warning("Unable to download raw file: %s - %s", ex, str_url_path_to_file)
+                self._active_connections -= 1
+                # Catch-all for other errors (connection resets, etc)
+                error_str = str(ex).lower()
+                if "ssl" in error_str or "connection" in error_str or "reset" in error_str:
+                    # Connection issues often indicate rate limiting
+                    self._record_download_failure("CONNECTION_ERROR")
+                    LOGGER.warning(
+                        "[CONNECTION] Connection error (possible rate limit) on %s: %s",
+                        str_url_path_to_file.split("/")[-1],
+                        ex
+                    )
+                else:
+                    LOGGER.warning("Unable to download raw file: %s - %s", ex, str_url_path_to_file)
+
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                     continue
+                self._failed_requests += 1
                 return 0
 
+        self._failed_requests += 1
         return 0  # All retries exhausted
 
     def _print_dump_statistics(self):
         """Print the latest dump statistics"""
+        # Print request benchmark statistics
+        self._print_request_benchmark()
+
         LOGGER.info(
             "Tried to dump data for %d tickers:",
             len(self.dict_new_points_saved_by_ticker),
@@ -870,6 +1084,51 @@ class BinanceDataDumper:
             self._print_full_dump_statististics()
         else:
             self._print_short_dump_statististics()
+
+    def _print_request_benchmark(self):
+        """Print detailed request benchmarking statistics"""
+        if self._request_count == 0:
+            return
+
+        print("\n" + "=" * 79)
+        print("REQUEST BENCHMARK STATISTICS")
+        print("=" * 79)
+
+        total_time = time.time() - self._request_start_time if self._request_start_time else 0
+        avg_rate = self._request_count / total_time if total_time > 0 else 0
+
+        success_pct = (self._successful_requests / self._request_count * 100) if self._request_count > 0 else 0
+        failed_pct = (self._failed_requests / self._request_count * 100) if self._request_count > 0 else 0
+
+        print(f"Total Requests Sent: {self._request_count}")
+        print(f"---> Successful: {self._successful_requests} ({success_pct:.1f}%)")
+        print(f"---> Failed: {self._failed_requests} ({failed_pct:.1f}%)")
+
+        print("Concurrent Connections:")
+        print(f"---> Peak Concurrent: {self._max_concurrent_connections}")
+        print(f"---> Configured Max: {self._max_concurrent_downloads}")
+
+        print("Request Rate:")
+        print(f"---> Average: {avg_rate:.2f} requests/second")
+        print(f"---> Total Duration: {total_time:.1f} seconds")
+
+        if self._request_timings:
+            avg_duration = sum(self._request_timings) / len(self._request_timings)
+            min_duration = min(self._request_timings)
+            max_duration = max(self._request_timings)
+            print("Request Duration:")
+            print(f"---> Average: {avg_duration:.2f} seconds")
+            print(f"---> Min: {min_duration:.2f} seconds")
+            print(f"---> Max: {max_duration:.2f} seconds")
+
+        if self._bytes_downloaded > 0:
+            mb_downloaded = self._bytes_downloaded / (1024 * 1024)
+            speed_mbps = (mb_downloaded * 8) / total_time if total_time > 0 else 0
+            print("Data Transfer:")
+            print(f"---> Total Downloaded: {mb_downloaded:.2f} MB")
+            print(f"---> Average Speed: {speed_mbps:.2f} Mbit/s")
+
+        print("=" * 79 + "\n")
 
     def _print_full_dump_statististics(self):
         """"""

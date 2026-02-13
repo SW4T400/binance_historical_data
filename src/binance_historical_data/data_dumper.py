@@ -50,6 +50,7 @@ class BinanceDataDumper:
         "spot": ("aggTrades", "klines", "trades"),
         "cm": (
             "aggTrades",
+            "fundingRate",
             "klines",
             "trades",
             "indexPriceKlines",
@@ -60,6 +61,7 @@ class BinanceDataDumper:
             "aggTrades",
             "bookDepth",
             "bookTicker",
+            "fundingRate",
             "indexPriceKlines",
             "klines",
             "liquidationSnapshot",
@@ -106,11 +108,15 @@ class BinanceDataDumper:
 
         Args:
             path_dir_where_to_dump (str): Folder where to dump data
-            asset_class (str): Asset class which data to get [spot, futures]
-            data_type (str): data type to dump: [aggTrades, klines, trades]
+            asset_class (str): Asset class which data to get [spot, um, cm]
+            data_type (str): data type to dump: \
+                spot: [aggTrades, klines, trades] \
+                um/cm futures: [aggTrades, klines, trades, fundingRate, \
+                indexPriceKlines, markPriceKlines, premiumIndexKlines, etc.]
             data_frequency (str): \
-                Data frequency. [1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h]
-                Defaults to "1m".
+                Data frequency for klines/indexPriceKlines/markPriceKlines/premiumIndexKlines. \
+                [1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1mo] \
+                Defaults to "1m". Not required for fundingRate (always 8-hour snapshots).
             max_concurrent_downloads (int): \
                 Maximum number of concurrent file downloads. \
                 Defaults to 1 for 'trades' (large files), 5 for all others. \

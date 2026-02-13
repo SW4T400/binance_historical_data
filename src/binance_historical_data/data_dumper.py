@@ -113,8 +113,8 @@ class BinanceDataDumper:
                 Defaults to "1m".
             max_concurrent_downloads (int): \
                 Maximum number of concurrent file downloads. \
-                Defaults to 1 for 'trades' (large files), 30 for all others. \
-                Community says 5 is conservative. We use 30 for faster downloads. \
+                Defaults to 1 for 'trades' (large files), 5 for all others. \
+                Community consensus: 5 is safe. Binance's own scripts use 2. \
                 Circuit breaker protects against rate limiting. \
                 Set explicitly to override auto-detection.
         """
@@ -157,8 +157,8 @@ class BinanceDataDumper:
         # Auto-detect concurrent downloads if not specified
         if max_concurrent_downloads is None:
             # Only 'trades' (not 'aggTrades') should default to 1
-            # Use 30 for others (testing higher concurrency on 300 Mbit line)
-            self._max_concurrent_downloads = 1 if data_type == "trades" else 30
+            # Use 5 for others (conservative to avoid Binance throttling)
+            self._max_concurrent_downloads = 1 if data_type == "trades" else 5
         else:
             self._max_concurrent_downloads = max_concurrent_downloads
 

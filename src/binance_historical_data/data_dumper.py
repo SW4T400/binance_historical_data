@@ -103,6 +103,8 @@ class BinanceDataDumper:
         data_type="klines",  # aggTrades, klines, trades
         data_frequency="1m",  # argument for data_type="klines"
         max_concurrent_downloads=None,  # max concurrent file downloads
+        country=None,  # e.g. "DE" - skips ipinfo.io lookup if provided
+        skip_if_exists_extensions=None,  # e.g. ["csv", "parquet"]
     ) -> None:
         """Init object to dump all data from binance servers
 
@@ -123,6 +125,16 @@ class BinanceDataDumper:
                 Community consensus: 5 is safe. Binance's own scripts use 2. \
                 Circuit breaker protects against rate limiting. \
                 Set explicitly to override auto-detection.
+            country (str | None): \
+                Your 2-letter country code (e.g. "DE", "US"). If provided, skips the \
+                ipinfo.io lookup entirely (avoids hitting its ~50 req/day free tier). \
+                Only matters for US users (selects binance.us vs binance.com). \
+                Defaults to None (auto-detect via ipinfo.io).
+            skip_if_exists_extensions (list[str] | None): \
+                File extensions to treat as "already downloaded" when deciding which \
+                dates to skip. Defaults to ["csv"]. Pass ["csv", "parquet"] if you \
+                delete CSVs after converting to Parquet — prevents re-downloading \
+                files whose CSV was removed but Parquet exists.
         """
         # Confirm editable install is working
         import os as _os_check
@@ -159,6 +171,8 @@ class BinanceDataDumper:
         self._base_url = "https://data.binance.vision/data"
         self._asset_class = asset_class
         self._data_type = data_type
+        self._country = country
+        self._skip_if_exists_extensions = skip_if_exists_extensions if skip_if_exists_extensions is not None else ["csv"]
 
         # Auto-detect concurrent downloads if not specified
         if max_concurrent_downloads is None:
@@ -394,7 +408,10 @@ class BinanceDataDumper:
     def get_list_all_trading_pairs(self):
         """Get all trading pairs available at binance now"""
         # Select the right Top Level Domain for US/non US
-        country_code = self._get_user_country_from_ip()
+        if self._country is not None:
+            country_code = self._country
+        else:
+            country_code = self._get_user_country_from_ip()
         if country_code == "US":
             tld = "us"
         else:
@@ -554,15 +571,17 @@ class BinanceDataDumper:
             self.path_dir_where_to_dump, path_folder_suffix
         )
         for date_obj in list_dates:
-            file_name = self.create_filename(
-                ticker,
-                date_obj,
-                timeperiod_per_file=timeperiod_per_file,
-                extension="csv",
-            )
-            path_where_to_save = os.path.join(str_dir_where_to_save, file_name)
-            if os.path.exists(path_where_to_save):
-                list_dates_with_data.append(date_obj)
+            for ext in self._skip_if_exists_extensions:
+                file_name = self.create_filename(
+                    ticker,
+                    date_obj,
+                    timeperiod_per_file=timeperiod_per_file,
+                    extension=ext,
+                )
+                path_where_to_save = os.path.join(str_dir_where_to_save, file_name)
+                if os.path.exists(path_where_to_save):
+                    list_dates_with_data.append(date_obj)
+                    break
 
         return list_dates_with_data
 
